@@ -122,8 +122,14 @@ def esc(text):
     return (text.replace("\\", "\\\\").replace(";", "\\;")
                 .replace(",", "\\,").replace("\n", "\\n"))
 
-
 def fold(line):
     # RFC 5545: lines no longer than 75 octets, continuations start with a space
     out, buf = [], ""
-    for
+    for ch in line:
+        if len((buf + ch).encode()) > 74:
+            out.append(buf)
+            buf = " " + ch
+        else:
+            buf += ch
+    out.append(buf)
+    return "\r\n".join(out)
