@@ -1,129 +1,77 @@
 #!/usr/bin/env python3
-"""Build an iCalendar (.ics) feed of upcoming UFC events from ESPN's public data.
-
-Uses only the Python standard library. Usage:
-    python ufc_ics.py public/ufc.ics
-"""
-import hashlib
+"""Build public/ufc.ics from ESPN's UFC scoreboard (standard library only)."""
 import json
+import re
 import sys
-import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-BASE = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
-LOOKBACK_DAYS = 14      # keep recent events so they don't vanish the day after
-LOOKAHEAD_DAYS = 365
-EVENT_HOURS = 6         # prelims through main card
+URL = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
+LOCAL = ZoneInfo("America/Chicago")  # times shown in event descriptions
+EVENT_HOURS = 6                      # length of each calendar block
+KEEP_PAST_DAYS = 14                  # keep recent cards for two weeks
 
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "ufc-ics/1.0"})
+def parse_dt(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def fetch():
+    req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
 
-def parse_dt(s):
-    # ESPN uses forms like "2026-11-14T23:00Z"
-    s = s.replace("Z", "+00:00")
-    if len(s) == 22:  # 2026-11-14T23:00+00:00 (no seconds)
-        s = s[:16] + ":00" + s[16:]
-    return datetime.fromisoformat(s).astimezone(timezone.utc)
-
-
-def fight_lines(event):
+def card_details(ev):
+    """Venue, start-time blocks and bout list for a fully published card."""
+    comps = ev.get("competitions", [])
+    venue = (comps[0].get("venue") or {}) if comps else {}
+    addr = venue.get("address") or {}
+    location = ", ".join(p for p in [venue.get("fullName"), addr.get("city"),
+                                     addr.get("state") or addr.get("country")] if p)
     lines = []
-    for comp in event.get("competitions", []):
-        names = [c.get("athlete", {}).get("displayName", "TBA")
-                 for c in comp.get("competitors", [])]
+    times = sorted({parse_dt(c["date"]) for c in comps if c.get("date")})
+    labels = ["Main card", "Prelims", "Early prelims"]
+    for label, t in zip(labels, reversed(times)):
+        lines.append(f"{label}: {t.astimezone(LOCAL):%a %b %-d, %-I:%M %p %Z}")
+    lines.append("")
+    for c in reversed(comps):  # ESPN lists earliest bout first; main event is last
+        names = [x.get("athlete", {}).get("displayName", "TBA") for x in c.get("competitors", [])]
+        weight = (c.get("type") or {}).get("abbreviation", "")
         if len(names) == 2:
-            lines.append(f"{names[0]} vs. {names[1]}")
-    # ESPN tends to list prelims first; reverse so the main event is on top
-    return list(reversed(lines))
+            lines.append(f"{names[0]} vs. {names[1]}" + (f" ({weight})" if weight else ""))
+    return location, lines
 
 
-def location(event):
-    for comp in event.get("competitions", []):
-        venue = comp.get("venue") or {}
-        addr = venue.get("address") or {}
-        parts = [venue.get("fullName"), addr.get("city"), addr.get("state") or addr.get("country")]
-        parts = [p for p in parts if p]
-        if parts:
-            return ", ".join(parts)
-    return ""
-
-
-def fetch_all(now):
-    """Try several ways of asking ESPN; keep whatever works and merge it."""
-    start = (now - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
-    end = (now + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y%m%d")
-    urls = [
-        BASE,                                  # current/next card + season calendar
-        f"{BASE}?dates={now.year}",            # whole current year
-        f"{BASE}?dates={now.year + 1}",        # whole next year
-        f"{BASE}?dates={start}-{end}",         # explicit date range
-    ]
-    results = []
-    for url in urls:
-        try:
-            results.append(fetch(url))
-            print(f"OK       {url}")
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
-            print(f"skipped  {url}  ({e})")
-    return results
-
-
-def collect_events():
+def collect(data):
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=LOOKBACK_DAYS)
-    responses = fetch_all(now)
-
     events = {}
-    for data in responses:
-        for ev in data.get("events", []):
-            try:
-                when = parse_dt(ev["date"])
-                if when < cutoff:
-                    continue
-                events[ev["id"]] = {
-                    "uid": ev["id"],
-                    "name": ev.get("name") or ev.get("shortName") or "UFC event",
-                    "start": when,
-                    "location": location(ev),
-                    "fights": fight_lines(ev),
-                    "link": f"https://www.espn.com/mma/fightcenter/_/id/{ev['id']}/league/ufc",
-                }
-            except (KeyError, ValueError):
+    # 1) The season calendar: every announced card, name + date only
+    for league in data.get("leagues", []):
+        for entry in league.get("calendar", []):
+            ref = (entry.get("event") or {}).get("$ref", "")
+            m = re.search(r"/events/(\d+)", ref)
+            if not m or "startDate" not in entry:
                 continue
-
-    # The league calendar often lists further-out events the other queries miss
-    seen = {(e["name"], e["start"].date()) for e in events.values()}
-    for data in responses:
-        for league in data.get("leagues", []):
-            for entry in league.get("calendar", []):
-                if not isinstance(entry, dict) or "startDate" not in entry:
-                    continue
-                try:
-                    when = parse_dt(entry["startDate"])
-                except ValueError:
-                    continue
-                name = entry.get("label") or "UFC event"
-                if when < cutoff or (name, when.date()) in seen:
-                    continue
-                seen.add((name, when.date()))
-                uid = f"cal-{when:%Y%m%d}-{hashlib.md5(name.encode()).hexdigest()[:8]}"
-                events[uid] = {"uid": uid, "name": name, "start": when,
-                               "location": "", "fights": [], "link": ""}
-    return sorted(events.values(), key=lambda e: e["start"])
+            events[m.group(1)] = {"id": m.group(1), "name": entry.get("label", "UFC event"),
+                                  "start": parse_dt(entry["startDate"]), "location": "",
+                                  "lines": ["Fight card details appear here closer to the event."]}
+    # 2) The next card in full detail: real start time, venue, bouts
+    for ev in data.get("events", []):
+        location, lines = card_details(ev)
+        events[ev["id"]] = {"id": ev["id"], "name": ev.get("name", "UFC event"),
+                            "start": parse_dt(ev["date"]), "location": location, "lines": lines}
+    keep = [e for e in events.values() if e["start"] > now - timedelta(days=KEEP_PAST_DAYS)]
+    return sorted(keep, key=lambda e: e["start"])
 
 
-def esc(text):
-    return (text.replace("\\", "\\\\").replace(";", "\\;")
-                .replace(",", "\\,").replace("\n", "\\n"))
+def esc(t):
+    return t.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
 
 def fold(line):
-    # RFC 5545: lines no longer than 75 octets, continuations start with a space
     out, buf = [], ""
     for ch in line:
         if len((buf + ch).encode()) > 74:
@@ -131,5 +79,36 @@ def fold(line):
             buf = " " + ch
         else:
             buf += ch
-    out.append(buf)
-    return "\r\n".join(out)
+    return "\r\n".join(out + [buf])
+
+
+def build_ics(events):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//ufc-ics//EN", "CALSCALE:GREGORIAN",
+           "METHOD:PUBLISH", "X-WR-CALNAME:UFC", "REFRESH-INTERVAL;VALUE=DURATION:PT12H"]
+    for e in events:
+        link = f"https://www.espn.com/mma/fightcenter/_/id/{e['id']}/league/ufc"
+        desc = "\n".join(e["lines"] + ["", link])
+        end = e["start"] + timedelta(hours=EVENT_HOURS)
+        out += ["BEGIN:VEVENT", f"UID:ufc-{e['id']}@ufc-ics", f"DTSTAMP:{stamp}",
+                f"DTSTART:{e['start']:%Y%m%dT%H%M%SZ}", f"DTEND:{end:%Y%m%dT%H%M%SZ}",
+                f"SUMMARY:{esc(e['name'])}", f"LOCATION:{esc(e['location'])}",
+                f"DESCRIPTION:{esc(desc)}", f"URL:{link}", "END:VEVENT"]
+    out.append("END:VCALENDAR")
+    return "\r\n".join(fold(l) for l in out) + "\r\n"
+
+
+def main():
+    out_path = Path(sys.argv[1] if len(sys.argv) > 1 else "public/ufc.ics")
+    events = collect(fetch())
+    if not events:
+        sys.exit("ESPN returned no upcoming events - not publishing an empty calendar.")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(build_ics(events), encoding="utf-8", newline="")
+    print(f"Wrote {len(events)} events to {out_path}")
+    for e in events:
+        print(f"  {e['start'].astimezone(LOCAL):%Y-%m-%d %I:%M %p}  {e['name']}")
+
+
+if __name__ == "__main__":
+    main()
