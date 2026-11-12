@@ -1,9 +1,9 @@
-name: Update UFC calendar
+name: Update sports calendars
 
 on:
   schedule:
-    - cron: "0 11 * * *"   # daily, ~5–6am Central
-  workflow_dispatch:        # lets you run it manually from the Actions tab
+    - cron: "0 11 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,16 +21,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Build feed
+      - name: Build feeds
         run: |
           python ufc_ics.py public/ufc.ics
-          python spurs_ics.py public/spurs.ics
+          python team_ics.py public
+          ls -l public
           test -s public/ufc.ics || { echo "ufc.ics was not created"; exit 1; }
-          test -s public/spurs.ics || { echo "spurs.ics was not created"; exit 1; }
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
