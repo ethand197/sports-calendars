@@ -7,6 +7,7 @@ Uses only the Python standard library. Usage:
 import hashlib
 import json
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,42 +54,67 @@ def location(event):
     return ""
 
 
-def collect_events():
-    now = datetime.now(timezone.utc)
+def fetch_all(now):
+    """Try several ways of asking ESPN; keep whatever works and merge it."""
     start = (now - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
     end = (now + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y%m%d")
-    data = fetch(f"{BASE}?dates={start}-{end}&limit=500")
+    urls = [
+        BASE,                                  # current/next card + season calendar
+        f"{BASE}?dates={now.year}",            # whole current year
+        f"{BASE}?dates={now.year + 1}",        # whole next year
+        f"{BASE}?dates={start}-{end}",         # explicit date range
+    ]
+    results = []
+    for url in urls:
+        try:
+            results.append(fetch(url))
+            print(f"OK       {url}")
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+            print(f"skipped  {url}  ({e})")
+    return results
+
+
+def collect_events():
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=LOOKBACK_DAYS)
+    responses = fetch_all(now)
 
     events = {}
-    for ev in data.get("events", []):
-        try:
-            events[ev["id"]] = {
-                "uid": ev["id"],
-                "name": ev.get("name") or ev.get("shortName") or "UFC event",
-                "start": parse_dt(ev["date"]),
-                "location": location(ev),
-                "fights": fight_lines(ev),
-                "link": f"https://www.espn.com/mma/fightcenter/_/id/{ev['id']}/league/ufc",
-            }
-        except (KeyError, ValueError):
-            continue
-
-    # The league calendar often lists further-out events that the range query misses
-    seen = {(e["name"], e["start"].date()) for e in events.values()}
-    for league in data.get("leagues", []):
-        for entry in league.get("calendar", []):
-            if not isinstance(entry, dict) or "startDate" not in entry:
-                continue
+    for data in responses:
+        for ev in data.get("events", []):
             try:
-                when = parse_dt(entry["startDate"])
-            except ValueError:
+                when = parse_dt(ev["date"])
+                if when < cutoff:
+                    continue
+                events[ev["id"]] = {
+                    "uid": ev["id"],
+                    "name": ev.get("name") or ev.get("shortName") or "UFC event",
+                    "start": when,
+                    "location": location(ev),
+                    "fights": fight_lines(ev),
+                    "link": f"https://www.espn.com/mma/fightcenter/_/id/{ev['id']}/league/ufc",
+                }
+            except (KeyError, ValueError):
                 continue
-            name = entry.get("label") or "UFC event"
-            if when < now - timedelta(days=LOOKBACK_DAYS) or (name, when.date()) in seen:
-                continue
-            uid = f"cal-{when:%Y%m%d}-{hashlib.md5(name.encode()).hexdigest()[:8]}"
-            events[uid] = {"uid": uid, "name": name, "start": when,
-                           "location": "", "fights": [], "link": ""}
+
+    # The league calendar often lists further-out events the other queries miss
+    seen = {(e["name"], e["start"].date()) for e in events.values()}
+    for data in responses:
+        for league in data.get("leagues", []):
+            for entry in league.get("calendar", []):
+                if not isinstance(entry, dict) or "startDate" not in entry:
+                    continue
+                try:
+                    when = parse_dt(entry["startDate"])
+                except ValueError:
+                    continue
+                name = entry.get("label") or "UFC event"
+                if when < cutoff or (name, when.date()) in seen:
+                    continue
+                seen.add((name, when.date()))
+                uid = f"cal-{when:%Y%m%d}-{hashlib.md5(name.encode()).hexdigest()[:8]}"
+                events[uid] = {"uid": uid, "name": name, "start": when,
+                               "location": "", "fights": [], "link": ""}
     return sorted(events.values(), key=lambda e: e["start"])
 
 
@@ -100,56 +126,4 @@ def esc(text):
 def fold(line):
     # RFC 5545: lines no longer than 75 octets, continuations start with a space
     out, buf = [], ""
-    for ch in line:
-        if len((buf + ch).encode()) > 74:
-            out.append(buf)
-            buf = " " + ch
-        else:
-            buf += ch
-    out.append(buf)
-    return "\r\n".join(out)
-
-
-def build_ics(events):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    lines = [
-        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//ufc-ics//EN",
-        "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-        "X-WR-CALNAME:UFC", "X-WR-CALDESC:Upcoming UFC events (auto-updated)",
-        "REFRESH-INTERVAL;VALUE=DURATION:PT12H", "X-PUBLISHED-TTL:PT12H",
-    ]
-    for e in events:
-        desc = "\n".join(e["fights"]) if e["fights"] else "Card TBA"
-        if e["link"]:
-            desc += f"\n\n{e['link']}"
-        end = e["start"] + timedelta(hours=EVENT_HOURS)
-        lines += [
-            "BEGIN:VEVENT",
-            f"UID:ufc-{e['uid']}@ufc-ics",
-            f"DTSTAMP:{stamp}",
-            f"DTSTART:{e['start']:%Y%m%dT%H%M%SZ}",
-            f"DTEND:{end:%Y%m%dT%H%M%SZ}",
-            f"SUMMARY:{esc(e['name'])}",
-            f"LOCATION:{esc(e['location'])}",
-            f"DESCRIPTION:{esc(desc)}",
-            "END:VEVENT",
-        ]
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(fold(l) for l in lines) + "\r\n"
-
-
-def main():
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "public/ufc.ics")
-    events = collect_events()
-    if not events:
-        # Fail loudly rather than publishing an empty calendar over a good one
-        sys.exit("No events returned from ESPN; leaving the existing feed alone.")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_ics(events), encoding="utf-8", newline="")
-    print(f"Wrote {len(events)} events to {out}")
-    for e in events:
-        print(f"  {e['start']:%Y-%m-%d %H:%M}Z  {e['name']}")
-
-
-if __name__ == "__main__":
-    main()
+    for
