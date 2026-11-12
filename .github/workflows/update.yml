@@ -26,7 +26,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build feed
-        run: python ufc_ics.py public/ufc.ics
+        run: |
+          python ufc_ics.py public/ufc.ics
+          python spurs_ics.py public/spurs.ics
+          test -s public/ufc.ics || { echo "ufc.ics was not created"; exit 1; }
+          test -s public/spurs.ics || { echo "spurs.ics was not created"; exit 1; }
       - uses: actions/upload-pages-artifact@v3
         with:
           path: public
